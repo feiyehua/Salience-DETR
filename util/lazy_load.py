@@ -17,7 +17,7 @@ except ImportError:
 class Config:
     def __init__(self, file_path, name_space={}, partials=()):
         self.partials = partials
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             code = f.read()
         if len(partials) != 0:
             code = self.partial_optim(code)
@@ -44,7 +44,7 @@ class Config:
 class LazyConfig:
     def __init__(self, file_path, name_space={}, lazy={}):
         self.lazy = lazy
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             code = f.read()
         if len(self.lazy) != 0:
             code = self.replace_call_with_lazy_call(code)

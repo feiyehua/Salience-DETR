@@ -375,3 +375,172 @@ class MultiScaleDeformableAttention(nn.Module):
         output = self.output_proj(output)
 
         return output
+
+
+class CrossScaleAttention(nn.Module):
+    """Cross-Scale Attention Module to facilitate direct information exchange between scales.
+    
+    This module enhances small object detection by creating direct attention paths between
+    small-scale (high-resolution) and large-scale (low-resolution) feature representations.
+    Small-scale tokens can directly attend to large-scale tokens to incorporate global context,
+    while large-scale tokens can refine their global understanding by attending to local details.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        max_tokens_per_level: int = 1024,
+    ):
+        """
+        Args:
+            embed_dim: The embedding dimension
+            num_heads: Number of attention heads
+            dropout: Dropout rate
+            max_tokens_per_level: Maximum number of tokens to consider per level for cross-scale attention
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.max_tokens_per_level = max_tokens_per_level
+        
+        # Small to large attention (small tokens query large tokens)
+        self.small_to_large_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Large to small attention (large tokens query small tokens)
+        self.large_to_small_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Output projections
+        self.small_proj = nn.Linear(embed_dim, embed_dim)
+        self.large_proj = nn.Linear(embed_dim, embed_dim)
+        
+        self.norm_small = nn.LayerNorm(embed_dim)
+        self.norm_large = nn.LayerNorm(embed_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        self.init_weights()
+        
+    def init_weights(self):
+        # Initialize the weights
+        xavier_uniform_(self.small_to_large_attn.in_proj_weight)
+        xavier_uniform_(self.large_to_small_attn.in_proj_weight)
+        constant_(self.small_to_large_attn.in_proj_bias, 0.)
+        constant_(self.large_to_small_attn.in_proj_bias, 0.)
+        
+        xavier_uniform_(self.small_to_large_attn.out_proj.weight)
+        xavier_uniform_(self.large_to_small_attn.out_proj.weight)
+        constant_(self.small_to_large_attn.out_proj.bias, 0.)
+        constant_(self.large_to_small_attn.out_proj.bias, 0.)
+        
+        xavier_uniform_(self.small_proj.weight)
+        xavier_uniform_(self.large_proj.weight)
+        constant_(self.small_proj.bias, 0.)
+        constant_(self.large_proj.bias, 0.)
+    
+    def sample_tokens(self, tokens, token_importance=None, max_tokens=None):
+        """Sample tokens based on importance scores or randomly if no scores provided
+        
+        Args:
+            tokens: Token features [B, N, C]
+            token_importance: Optional importance score for each token [B, N]
+            max_tokens: Maximum tokens to sample (defaults to self.max_tokens_per_level)
+        
+        Returns:
+            Sampled tokens [B, max_tokens, C]
+        """
+        batch_size, num_tokens, channels = tokens.shape
+        max_tokens = max_tokens or self.max_tokens_per_level
+        max_tokens = min(max_tokens, num_tokens)
+        
+        if token_importance is not None:
+            # Sample tokens based on importance
+            _, indices = torch.topk(token_importance, max_tokens, dim=1)
+            batch_indices = torch.arange(batch_size, device=tokens.device)[:, None]
+            sampled_tokens = tokens[batch_indices, indices]
+        else:
+            # Random sampling if no importance score
+            if num_tokens <= max_tokens:
+                return tokens
+                
+            indices = torch.randperm(num_tokens, device=tokens.device)[:max_tokens]
+            sampled_tokens = tokens[:, indices]
+            
+        return sampled_tokens
+    
+    def forward(
+        self, 
+        small_scale_tokens: Tensor,  # [B, Ns, C]
+        large_scale_tokens: Tensor,  # [B, Nl, C]
+        small_scale_pos: Tensor = None,  # [B, Ns, C]
+        large_scale_pos: Tensor = None,  # [B, Nl, C]
+        small_token_importance: Tensor = None,  # [B, Ns]
+        large_token_importance: Tensor = None,  # [B, Nl]
+        need_weights: bool = False,
+    ):
+        """
+        Args:
+            small_scale_tokens: High-resolution small-scale tokens (e.g., from P2)
+            large_scale_tokens: Low-resolution large-scale tokens (e.g., from P5)
+            small_scale_pos: Position encoding for small-scale tokens
+            large_scale_pos: Position encoding for large-scale tokens
+            small_token_importance: Importance scores for small tokens (e.g., salience scores)
+            large_token_importance: Importance scores for large tokens
+            need_weights: Whether to return attention weights
+            
+        Returns:
+            Enhanced small and large scale tokens
+        """
+        # Sample tokens if there are too many
+        sampled_small_tokens = self.sample_tokens(small_scale_tokens, small_token_importance)
+        sampled_large_tokens = self.sample_tokens(large_scale_tokens, large_token_importance)
+        
+        if small_scale_pos is not None:
+            # Sample positions too
+            batch_size = small_scale_tokens.shape[0]
+            small_indices = torch.arange(sampled_small_tokens.shape[1], device=small_scale_tokens.device)
+            large_indices = torch.arange(sampled_large_tokens.shape[1], device=large_scale_tokens.device)
+            
+            sampled_small_pos = small_scale_pos[:, small_indices] if small_scale_pos is not None else None
+            sampled_large_pos = large_scale_pos[:, large_indices] if large_scale_pos is not None else None
+        else:
+            sampled_small_pos = None
+            sampled_large_pos = None
+        
+        # Add positional embeddings if available
+        small_tokens = sampled_small_tokens if sampled_small_pos is None else sampled_small_tokens + sampled_small_pos
+        large_tokens = sampled_large_tokens if sampled_large_pos is None else sampled_large_tokens + sampled_large_pos
+        
+        # Small-scale tokens attend to large-scale tokens
+        small_attn_out, small_attn_weights = self.small_to_large_attn(
+            query=small_tokens,
+            key=large_tokens,
+            value=sampled_large_tokens,
+            need_weights=need_weights
+        )
+        
+        # Large-scale tokens attend to small-scale tokens
+        large_attn_out, large_attn_weights = self.large_to_small_attn(
+            query=large_tokens,
+            key=small_tokens,
+            value=sampled_small_tokens,
+            need_weights=need_weights
+        )
+        
+        # Apply projection and residual connection
+        enhanced_small_tokens = sampled_small_tokens + self.dropout(self.small_proj(small_attn_out))
+        enhanced_large_tokens = sampled_large_tokens + self.dropout(self.large_proj(large_attn_out))
+        
+        # Apply normalization
+        enhanced_small_tokens = self.norm_small(enhanced_small_tokens)
+        enhanced_large_tokens = self.norm_large(enhanced_large_tokens)
+        
+        if need_weights:
+            return enhanced_small_tokens, enhanced_large_tokens, small_attn_weights, large_attn_weights
+        
+        return enhanced_small_tokens, enhanced_large_tokens

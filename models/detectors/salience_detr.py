@@ -192,15 +192,43 @@ class SalienceDETR(DNDETRDetector):
             denoising_groups = None
             max_gt_num_per_image = None
 
-        # feed into transformer
-        outputs_class, outputs_coord, enc_class, enc_coord, foreground_mask = self.transformer(
+        # feed into transformer - 新接口
+        transformer_outputs = self.transformer(
             multi_level_feats,
             multi_level_masks,
             multi_level_position_embeddings,
             noised_label_query,
             noised_box_query,
-            attn_mask=attn_mask,
+            attn_mask,
         )
+        
+        # 从返回的字典中提取输出
+        outputs_class = []
+        outputs_coord = []
+        
+        # 提取主要输出
+        pred_logits = transformer_outputs["pred_logits"]
+        pred_boxes = transformer_outputs["pred_boxes"]
+        
+        # 提取辅助输出
+        if "aux_outputs" in transformer_outputs:
+            for aux_output in transformer_outputs["aux_outputs"]:
+                outputs_class.append(aux_output["pred_logits"])
+                outputs_coord.append(aux_output["pred_boxes"])
+        
+        # 主输出放在最后
+        outputs_class.append(pred_logits)
+        outputs_coord.append(pred_boxes)
+        
+        # 提取编码器输出
+        enc_outputs = transformer_outputs["enc_outputs"]
+        enc_class = enc_outputs["pred_logits"]
+        enc_coord = enc_outputs["pred_boxes"]
+        
+        # 提取前景掩码（如果存在）
+        foreground_score = transformer_outputs.get("foreground_score", None)
+        foreground_inds = transformer_outputs.get("foreground_inds", None)
+        
         # hack implementation for distributed training
         outputs_class[0] += self.denoising_generator.label_encoder.weight[0, 0] * 0.0
 
@@ -212,7 +240,7 @@ class SalienceDETR(DNDETRDetector):
             }
             outputs_class, outputs_coord = self.dn_post_process(outputs_class, outputs_coord, dn_metas)
 
-            # prepare for loss computation
+        # prepare for loss computation
         output = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
         if self.aux_loss:
             output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -226,13 +254,27 @@ class SalienceDETR(DNDETRDetector):
             dn_losses = self.compute_dn_loss(dn_metas, targets)
             loss_dict.update(dn_losses)
 
-            # compute focus loss
-            feature_stride = [(
-                images.tensors.shape[-2] / feature.shape[-2],
-                images.tensors.shape[-1] / feature.shape[-1],
-            ) for feature in multi_level_feats]
-            focus_loss = self.focus_criterion(foreground_mask, targets, feature_stride, images.image_sizes)
-            loss_dict.update(focus_loss)
+            # compute focus loss (如果有前景掩码)
+            if foreground_score is not None:
+                # 将前景掩码转换为多层次格式
+                foreground_mask = []
+                for i, mask in enumerate(multi_level_masks):
+                    batch_size = mask.shape[0]
+                    h, w = mask.shape[1], mask.shape[2]
+                    mask_shape = (batch_size, 1, h, w)
+                    level_mask = torch.zeros(mask_shape, device=mask.device)
+                    # 使用foreground_score和foreground_inds填充mask
+                    if i < len(foreground_score):
+                        # 这里需要根据实际实现调整
+                        level_mask = foreground_score[:, :, i].view(batch_size, 1, h, w)
+                    foreground_mask.append(level_mask)
+                
+                feature_stride = [(
+                    images.tensors.shape[-2] / feature.shape[-2],
+                    images.tensors.shape[-1] / feature.shape[-1],
+                ) for feature in multi_level_feats]
+                focus_loss = self.focus_criterion(foreground_mask, targets, feature_stride, images.image_sizes)
+                loss_dict.update(focus_loss)
 
             # loss reweighting
             weight_dict = self.criterion.weight_dict

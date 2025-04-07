@@ -2,6 +2,7 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 from torchvision.ops.boxes import _box_cxcywh_to_xyxy, generalized_box_iou
+from torchvision.ops.boxes import box_area
 
 
 class HungarianMatcher(nn.Module):
@@ -17,6 +18,8 @@ class HungarianMatcher(nn.Module):
     :param focal_alpha: The alpha parameter of the focal loss, defaults to 0.25
     :param focal_gamma: The gamma parameter of the focal loss, defaults to 2.0
     :param mixed_match: If True, mixed assignment is used, defaults to False
+    :param small_object_size: Size threshold below which objects are considered small (as ratio of image area)
+    :param small_object_iou_scale: Scale factor for IoU threshold for small objects
     """
     def __init__(
         self,
@@ -26,6 +29,8 @@ class HungarianMatcher(nn.Module):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         mixed_match: bool = False,
+        small_object_size: float = 0.04,  # 4% of image area
+        small_object_iou_scale: float = 0.9,  # Scale factor for small objects (e.g., 0.9)
     ):
         super().__init__()
 
@@ -37,6 +42,10 @@ class HungarianMatcher(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.mixed_match = mixed_match
+        
+        # Parameters for small object refinement
+        self.small_object_size = small_object_size
+        self.small_object_iou_scale = small_object_iou_scale
 
     def calculate_class_cost(self, pred_logits, gt_labels, **kwargs):
         out_prob = pred_logits.sigmoid()
@@ -68,6 +77,34 @@ class HungarianMatcher(nn.Module):
         # Final cost matrix
         c = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         return c
+
+    def scale_aware_iou_thresholds(self, boxes, image_size=(1.0, 1.0)):
+        """Compute scale-aware IoU thresholds based on box size
+        
+        Args:
+            boxes: Boxes in cxcywh format
+            image_size: Image size (height, width) for relative area calculation
+            
+        Returns:
+            Tensor of IoU thresholds for each box
+        """
+        # Calculate the area of each box relative to image size
+        areas = boxes[:, 2] * boxes[:, 3] / (image_size[0] * image_size[1])
+        
+        # Determine if boxes are small
+        is_small = areas < self.small_object_size
+        
+        # Default IoU threshold (0.5, 0.6, 0.7 for cascade stages)
+        base_iou_threshold = torch.ones_like(areas) * 0.5
+        
+        # Apply scaling factor to IoU threshold for small objects
+        iou_thresholds = torch.where(
+            is_small,
+            base_iou_threshold * self.small_object_iou_scale,  # For small objects
+            base_iou_threshold  # For normal objects
+        )
+        
+        return iou_thresholds
 
     @torch.no_grad()
     def forward(

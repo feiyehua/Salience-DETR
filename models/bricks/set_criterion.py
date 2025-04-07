@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.ops import boxes as box_ops
 
-from models.bricks.losses import sigmoid_focal_loss, vari_sigmoid_focal_loss
+from models.bricks.losses import sigmoid_focal_loss, vari_sigmoid_focal_loss, complete_iou_loss
 from util.utils import get_world_size, is_dist_avail_and_initialized
 
 
@@ -171,6 +171,43 @@ class SetCriterion(nn.Module):
 
 
 class HybridSetCriterion(SetCriterion):
+    def __init__(
+        self,
+        num_classes: int,
+        matcher: nn.Module,
+        weight_dict: Dict,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        two_stage_binary_cls=False,
+        # Added for small object enhancement
+        small_object_threshold: float = 0.04,  # 4% of image area
+        small_object_weight_factor: float = 2.0,  # Weight factor for small objects
+        use_ciou_loss: bool = True  # 是否使用CIoU损失
+    ):
+        """Create the criterion with enhanced small object detection.
+
+        :param num_classes: number of object categories, omitting the special no-object category
+        :param matcher: module able to compute a matching between targets and proposals
+        :param weight_dict: dict containing as key the names of the losses and as values their relative weight
+        :param alpha: alpha in Focal Loss, defaults to 0.25
+        :param gamma: gamma in Focal loss, defaults to 2.0
+        :param two_stage_binary_cls: Whether to use two-stage binary classification loss, defaults to False
+        :param small_object_threshold: Size threshold below which objects are considered small
+        :param small_object_weight_factor: How much more weight to give to small objects
+        :param use_ciou_loss: Whether to use CIoU loss instead of GIoU loss
+        """
+        super().__init__(
+            num_classes,
+            matcher,
+            weight_dict,
+            alpha,
+            gamma,
+            two_stage_binary_cls
+        )
+        self.small_object_threshold = small_object_threshold
+        self.small_object_weight_factor = small_object_weight_factor
+        self.use_ciou_loss = use_ciou_loss
+
     def loss_labels(self, outputs, targets, num_boxes, indices, **kwargs):
         assert "pred_boxes" in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -198,6 +235,14 @@ class HybridSetCriterion(SetCriterion):
         target_score = torch.zeros_like(target_classes, dtype=iou_score.dtype)
         target_score[idx] = iou_score
 
+        # Calculate box areas for scale-aware weighting
+        target_areas = target_boxes[:, 2] * target_boxes[:, 3]  # w * h
+        scale_weights = self.scale_aware_loss_weights(target_areas)
+        
+        # Create a scale weight tensor for all queries (initialized with 1.0)
+        query_scale_weights = torch.ones_like(target_classes, dtype=scale_weights.dtype)
+        query_scale_weights[idx] = scale_weights
+
         loss_class = (
             vari_sigmoid_focal_loss(
                 src_logits,
@@ -208,5 +253,75 @@ class HybridSetCriterion(SetCriterion):
                 gamma=self.gamma,
             ) * src_logits.shape[1]
         )
+        # Apply scale-aware weighting
+        loss_class = loss_class * query_scale_weights.mean()
         losses = {"loss_class": loss_class}
         return losses
+        
+    def loss_boxes(self, outputs, targets, num_boxes, indices, **kwargs):
+        """Compute the losses related to the bounding boxes with scale-aware weighting
+        
+        Enhances loss calculation for small objects by giving them higher weights
+        """
+        assert "pred_boxes" in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs["pred_boxes"][idx]
+        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        # Calculate box areas for scale-aware weighting
+        target_areas = target_boxes[:, 2] * target_boxes[:, 3]  # w * h
+        scale_weights = self.scale_aware_loss_weights(target_areas)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        
+        # Apply scale-aware weighting: give more weight to small objects
+        loss_bbox = loss_bbox * scale_weights.unsqueeze(1)
+        
+        losses = {}
+        losses["loss_bbox"] = loss_bbox.sum() / num_boxes
+
+        # 使用CIoU损失替代GIoU损失
+        if self.use_ciou_loss:
+            loss_ciou = complete_iou_loss(src_boxes, target_boxes)
+            # 应用尺度感知权重
+            loss_ciou = loss_ciou * scale_weights
+            losses["loss_giou"] = loss_ciou.sum() / num_boxes
+        else:
+            # 原始GIoU损失计算
+            loss_giou = 1 - torch.diag(
+                box_ops.generalized_box_iou(
+                    box_ops._box_cxcywh_to_xyxy(src_boxes),
+                    box_ops._box_cxcywh_to_xyxy(target_boxes),
+                )
+            )
+            # 应用尺度感知权重
+            loss_giou = loss_giou * scale_weights
+            losses["loss_giou"] = loss_giou.sum() / num_boxes
+        
+        return losses
+        
+    def scale_aware_loss_weights(self, box_areas):
+        """Calculate scale-aware weights for loss calculation.
+        
+        Small objects receive higher weights in the loss calculation.
+        
+        Args:
+            box_areas: Tensor of box areas (normalized)
+            
+        Returns:
+            Weights tensor same shape as box_areas 
+        """
+        # Determine if boxes are small
+        is_small = box_areas < self.small_object_threshold
+        
+        # Default weight is 1.0
+        weights = torch.ones_like(box_areas)
+        
+        # Apply higher weight to small objects
+        weights = torch.where(
+            is_small,
+            torch.ones_like(box_areas) * self.small_object_weight_factor,  # Higher weight for small objects
+            torch.ones_like(box_areas)  # Normal weight for larger objects
+        )
+        
+        return weights

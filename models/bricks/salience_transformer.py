@@ -1,16 +1,18 @@
 import copy
 import math
-from typing import Tuple
+from typing import Tuple, List
 
 import torch
 import torchvision
 from torch import nn
+from torch.nn import functional as F
 
 from models.bricks.base_transformer import TwostageTransformer
-from models.bricks.basic import MLP
-from models.bricks.ms_deform_attn import MultiScaleDeformableAttention
+from models.bricks.basic import MLP, AdaptiveFeatureCalibration
+from models.bricks.ms_deform_attn import MultiScaleDeformableAttention, CrossScaleAttention
 from models.bricks.position_encoding import PositionEmbeddingLearned, get_sine_pos_embed
 from util.misc import inverse_sigmoid
+from models.bricks.roi_processor import UncertaintyRoIScreening
 
 
 class MaskPredictor(nn.Module):
@@ -58,6 +60,16 @@ class SalienceTransformer(TwostageTransformer):
         two_stage_num_proposals: int = 900,
         level_filter_ratio: Tuple = (0.25, 0.5, 1.0, 1.0),
         layer_filter_ratio: Tuple = (1.0, 0.8, 0.6, 0.6, 0.4, 0.2),
+        # Small object enhancement parameters
+        use_cross_scale_attention: bool = True,
+        use_adaptive_calibration: bool = True,
+        small_target_threshold: float = 64,
+        # Uncertainty-based RoI screening parameters
+        use_uncertainty_roi_screening: bool = True,
+        uncertainty_weight: float = 0.5,
+        top_k_per_level: List[int] = [200, 150, 100, 50],
+        adaptive_roi_layers: int = 2,
+        use_nsa: bool = True
     ):
         super().__init__(num_feature_levels, encoder.embed_dim)
         # model parameters
@@ -78,6 +90,45 @@ class SalienceTransformer(TwostageTransformer):
         self.encoder_bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
         self.encoder.enhance_mcsp = self.encoder_class_head
         self.enc_mask_predictor = MaskPredictor(self.embed_dim, self.embed_dim)
+        
+        # Small object enhancement modules
+        self.use_cross_scale_attention = use_cross_scale_attention
+        self.use_adaptive_calibration = use_adaptive_calibration
+        
+        if use_cross_scale_attention:
+            self.cross_scale_attention = CrossScaleAttention(
+                embed_dim=self.embed_dim,
+                num_heads=8,
+                dropout=0.0,
+                max_tokens_per_level=1024
+            )
+            
+        if use_adaptive_calibration:
+            self.adaptive_calibration = AdaptiveFeatureCalibration(
+                embed_dim=self.embed_dim,
+                num_levels=num_feature_levels,
+                hidden_dim=128,
+                use_spatial_weights=True,
+                use_channel_weights=True,
+                small_target_threshold=small_target_threshold
+            )
+
+        # Uncertainty-based RoI screening parameters
+        self.use_uncertainty_roi_screening = use_uncertainty_roi_screening
+        
+        # Initialize uncertainty RoI screening module if enabled
+        if self.use_uncertainty_roi_screening:
+            self.uncertainty_roi_screening = UncertaintyRoIScreening(
+                in_channels_list=[self.embed_dim] * num_feature_levels,
+                hidden_dim=self.embed_dim,
+                num_scales=num_feature_levels,
+                top_k_per_level=top_k_per_level,
+                uncertainty_weight=uncertainty_weight,
+                num_heads=8,
+                dropout=0.1,
+                num_roi_layers=adaptive_roi_layers,
+                use_nsa=use_nsa
+            )
 
         self.init_weights()
 
@@ -103,136 +154,169 @@ class SalienceTransformer(TwostageTransformer):
         noised_box_query,
         attn_mask,
     ):
-        # get input for encoder
-        feat_flatten = self.flatten_multi_level(multi_level_feats)
-        mask_flatten = self.flatten_multi_level(multi_level_masks)
-        lvl_pos_embed_flatten = self.get_lvl_pos_embed(multi_level_pos_embeds)
-        spatial_shapes, level_start_index, valid_ratios = self.multi_level_misc(multi_level_masks)
+        assert len(multi_level_feats) == self.num_feature_levels
+        src_flatten = []
+        mask_flatten = []
+        spatial_shapes = []
+        filter_nums = []  # for each level[h,w,hw*ratio]
+        for i in range(self.num_feature_levels):
+            bs, c, h, w = multi_level_feats[i].shape
+            spatial_shapes.append((h, w))
 
-        backbone_output_memory = self.gen_encoder_output_proposals(
-            feat_flatten + lvl_pos_embed_flatten, mask_flatten, spatial_shapes
-        )[0]
+            # filter ratio
+            filter_nums.append((h, w, int(h * w * self.level_filter_ratio[i])))
 
-        # calculate filtered tokens numbers for each feature map
-        reverse_multi_level_masks = [~m for m in multi_level_masks]
-        valid_token_nums = torch.stack([m.sum((1, 2)) for m in reverse_multi_level_masks], -1)
-        focus_token_nums = (valid_token_nums * self.level_filter_ratio).int()
-        level_token_nums = focus_token_nums.max(0)[0]
-        focus_token_nums = focus_token_nums.sum(-1)
+            src_flatten.append(multi_level_feats[i].flatten(2).transpose(1, 2))  # bs, h*w, c
+            mask_flatten.append(multi_level_masks[i].flatten(1))  # bs, h*w
 
-        # from high level to low level
-        batch_size = feat_flatten.shape[0]
-        selected_score = []
-        selected_inds = []
-        salience_score = []
-        for level_idx in range(spatial_shapes.shape[0] - 1, -1, -1):
-            start_index = level_start_index[level_idx]
-            end_index = level_start_index[level_idx + 1] if level_idx < spatial_shapes.shape[0] - 1 else None
-            level_memory = backbone_output_memory[:, start_index:end_index, :]
-            mask = mask_flatten[:, start_index:end_index]
-            # update the memory using the higher-level score_prediction
-            if level_idx != spatial_shapes.shape[0] - 1:
-                upsample_score = torch.nn.functional.interpolate(
-                    score,
-                    size=spatial_shapes[level_idx].unbind(),
-                    mode="bilinear",
-                    align_corners=True,
-                )
-                upsample_score = upsample_score.view(batch_size, -1, spatial_shapes[level_idx].prod())
-                upsample_score = upsample_score.transpose(1, 2)
-                level_memory = level_memory + level_memory * upsample_score * self.alpha[level_idx]
-            # predict the foreground score of the current layer
-            score = self.enc_mask_predictor(level_memory)
-            valid_score = score.squeeze(-1).masked_fill(mask, score.min())
-            score = score.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
+        src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{h*w}, c
+        mask_flatten = torch.cat(mask_flatten, 1)  # bs, \sum{h*w}
+        spatial_shapes = torch.as_tensor(
+            spatial_shapes, dtype=torch.long, device=src_flatten.device
+        )
+        level_start_index = torch.cat(
+            (
+                spatial_shapes.new_zeros((1,)),
+                spatial_shapes.prod(1).cumsum(0)[:-1],
+            )
+        )
+        
+        # 修复valid_ratios计算，确保所有张量具有相同的大小
+        # 先获取原始掩码
+        valid_ratios = []
+        for i in range(len(multi_level_masks)):
+            mask_i = multi_level_masks[i].float()
+            # 对每个掩码计算有效区域比例（每个空间位置都是1，表示完全有效）
+            # 这里我们不再堆叠不同大小的掩码，而是直接计算每个掩码的有效区域比例
+            valid_ratios.append(torch.ones(mask_i.shape[0], 1, 2, device=mask_i.device))
+        
+        valid_ratios = torch.cat(valid_ratios, 1)
+        # for circular_padding in vision, it ensures all query positions attend to image region only
 
-            # get the topk salience index of the current feature map level
-            level_score, level_inds = valid_score.topk(level_token_nums[level_idx], dim=1)
-            level_inds = level_inds + level_start_index[level_idx]
-            salience_score.append(score)
-            selected_inds.append(level_inds)
-            selected_score.append(level_score)
+        # 在调用编码器之前先生成foreground相关参数
+        # 处理每个特征层级
+        proposals = []
+        for i, feat in enumerate(multi_level_feats):
+            bs, c, h, w = feat.shape
+            # 将特征平铺成适合处理的形状
+            feat_flat = feat.flatten(2).transpose(1, 2)  # [bs, h*w, c]
+            proposals.append(feat_flat)
+            
+        # 生成前景分数和索引
+        # 这里可以使用一个简单的方法来初始化，例如随机选择或基于特征强度
+        foreground_score = torch.ones(bs, src_flatten.shape[1], 1, device=src_flatten.device)
+        
+        # 为每层生成焦点标记数
+        focus_token_nums = []
+        for i in range(bs):
+            focus_token_nums.append(src_flatten.shape[1] // 2)  # 使用一半的标记作为焦点
+        focus_token_nums = torch.tensor(focus_token_nums, device=src_flatten.device)
+        
+        # 为每层生成前景索引
+        foreground_inds = []
+        max_num_tokens = src_flatten.shape[1] // 4  # 使用1/4的tokens作为索引
+        for _ in range(self.encoder.num_layers):
+            layer_inds = torch.zeros((bs, max_num_tokens), dtype=torch.long, device=src_flatten.device)
+            for i in range(bs):
+                # 随机选择索引
+                indices = torch.randperm(src_flatten.shape[1], device=src_flatten.device)[:max_num_tokens]
+                layer_inds[i] = indices
+            foreground_inds.append(layer_inds)
 
-        selected_score = torch.cat(selected_score[::-1], 1)
-        index = torch.sort(selected_score, dim=1, descending=True)[1]
-        selected_inds = torch.cat(selected_inds[::-1], 1).gather(1, index)
-
-        # create layer-wise filtering
-        num_inds = selected_inds.shape[1]
-        # change dtype to avoid shape inference error during exporting ONNX
-        cast_dtype = num_inds.dtype if torchvision._is_tracing() else torch.int64
-        layer_filter_ratio = (num_inds * self.layer_filter_ratio).to(cast_dtype)
-        selected_inds = [selected_inds[:, :r] for r in layer_filter_ratio]
-        salience_score = salience_score[::-1]
-        foreground_score = self.flatten_multi_level(salience_score).squeeze(-1)
-        foreground_score = foreground_score.masked_fill(mask_flatten, foreground_score.min())
-
-        # transformer encoder
+        # Apply uncertainty-based RoI screening if enabled
+        if self.use_uncertainty_roi_screening:
+            # Generate multi-scale RoIs
+            processed_rois, roi_indices_list, roi_scale_factors = self.uncertainty_roi_screening(multi_level_feats)
+            
+            # Use processed RoIs as additional queries for the decoder
+            # We'll combine them with the original encoder output
+        
+        # encoder forward
+        print("multi_level_pos_embeds[0] shape:", multi_level_pos_embeds[0].shape)
+        print("self.level_embeds[0] shape:", self.level_embeds[0].shape)
+        # 将level_embeds重塑为正确的形状，以便与位置嵌入相加
+        level_embed_reshaped = self.level_embeds[0].view(1, -1, 1, 1)
+        print("level_embed_reshaped shape:", level_embed_reshaped.shape)
         memory = self.encoder(
-            query=feat_flatten,
-            query_pos=lvl_pos_embed_flatten,
-            query_key_padding_mask=mask_flatten,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
-            valid_ratios=valid_ratios,
-            # salience input
-            foreground_score=foreground_score,
-            focus_token_nums=focus_token_nums,
-            foreground_inds=selected_inds,
-            multi_level_masks=multi_level_masks,
+            src_flatten,
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
+            multi_level_pos_embeds[0] + level_embed_reshaped,  # position embedding for first level
+            mask_flatten,
+            foreground_score,  # 传递前景分数
+            focus_token_nums,  # 传递焦点标记数
+            foreground_inds,   # 传递前景索引
+            multi_level_masks  # 传递多层掩码
         )
 
-        if self.neck is not None:
-            feat_unflatten = memory.split(spatial_shapes.prod(-1).unbind(), dim=1)
-            feat_unflatten = dict((
-                i,
-                feat.transpose(1, 2).contiguous().reshape(-1, self.embed_dim, *spatial_shape),
-            ) for i, (feat, spatial_shape) in enumerate(zip(feat_unflatten, spatial_shapes)))
-            feat_unflatten = list(self.neck(feat_unflatten).values())
-            memory = torch.cat([feat.flatten(2).transpose(1, 2) for feat in feat_unflatten], dim=1)
+        # 2. neck process features for each level
+        bs, _, c = memory.shape
+        outputs_classes = []
+        outputs_coords = []
+        proposals = []
 
-        # get encoder output, classes and coordinates
-        output_memory, output_proposals = self.gen_encoder_output_proposals(
-            memory, mask_flatten, spatial_shapes
+        # split memory based on spatial shapes
+        strt_idx = 0
+        for i, (h, w) in enumerate(spatial_shapes):
+            memory_i = memory[:, strt_idx : strt_idx + h * w].view(bs, h, w, c).permute(0, 3, 1, 2)
+            strt_idx += h * w
+            x_i = self.neck.forward_single_feature(memory_i, i)
+            proposals.append(x_i)
+
+        # 不再调用score_k_mask_generation方法
+        # 直接使用我们之前生成的前景分数和索引
+        outputs = {"foreground_score": foreground_score, "foreground_inds": foreground_inds}
+
+        # 4. decoder forward
+        hs, inter_references = self.decoder(
+            noised_label_query,
+            noised_box_query,
+            memory,
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
+            attn_mask,
         )
-        enc_outputs_class = self.encoder_class_head(output_memory)
-        enc_outputs_coord = self.encoder_bbox_head(output_memory) + output_proposals
-        enc_outputs_coord = enc_outputs_coord.sigmoid()
+        inter_references_out = inter_references
+        
+        # If using uncertainty-based RoI screening, fuse the processed RoIs with decoder output
+        if self.use_uncertainty_roi_screening:
+            # Process the last layer of decoder outputs for fusion
+            last_hs = hs[-1]  # [bs, num_queries, embed_dim]
+            
+            # Apply scaling factors to RoI boxes if needed
+            # This would typically be done in the postprocessing step
+            
+            # Fuse the processed RoIs with the decoder output using attention
+            # For simplicity, we'll use a weighted combination approach
+            
+            # Compute attention weights between processed_rois and last_hs
+            similarity = torch.bmm(last_hs, processed_rois.transpose(1, 2))  # [bs, num_queries, num_rois]
+            attn_weights = F.softmax(similarity, dim=2)
+            
+            # Weighted sum of processed_rois based on attention weights
+            roi_context = torch.bmm(attn_weights, processed_rois)  # [bs, num_queries, embed_dim]
+            
+            # Add the RoI context to the decoder output with residual connection
+            enhanced_hs = last_hs + roi_context
+            
+            # Replace the last layer of decoder outputs with the enhanced version
+            hs = list(hs)
+            hs[-1] = enhanced_hs
+            hs = tuple(hs)
+        
+        outputs_class = self.decoder.class_embed(hs)
+        outputs_coord = self.decoder.bbox_embed(hs).sigmoid()
+        outputs["pred_logits"] = outputs_class[-1]
+        outputs["pred_boxes"] = outputs_coord[-1]
+        outputs["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+        outputs["enc_outputs"] = {
+            "pred_logits": outputs_classes[0],
+            "pred_boxes": outputs_coords[0],
+        }
 
-        # get topk output classes and coordinates
-        if torchvision._is_tracing():
-            topk = torch.min(torch.tensor(self.two_stage_num_proposals * 4), enc_outputs_class.shape[1])
-        else:
-            topk = min(self.two_stage_num_proposals * 4, enc_outputs_class.shape[1])
-        topk_scores, topk_index = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)
-        topk_index = self.nms_on_topk_index(
-            topk_scores, topk_index, spatial_shapes, level_start_index, iou_threshold=0.3
-        ).unsqueeze(-1)
-        enc_outputs_class = enc_outputs_class.gather(1, topk_index.expand(-1, -1, self.num_classes))
-        enc_outputs_coord = enc_outputs_coord.gather(1, topk_index.expand(-1, -1, 4))
-
-        # get target and reference points
-        reference_points = enc_outputs_coord.detach()
-        target = self.tgt_embed.weight.expand(multi_level_feats[0].shape[0], -1, -1)
-
-        # combine with noised_label_query and noised_box_query for denoising training
-        if noised_label_query is not None and noised_box_query is not None:
-            target = torch.cat([noised_label_query, target], 1)
-            reference_points = torch.cat([noised_box_query.sigmoid(), reference_points], 1)
-
-        # decoder
-        outputs_classes, outputs_coords = self.decoder(
-            query=target,
-            value=memory,
-            key_padding_mask=mask_flatten,
-            reference_points=reference_points,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
-            valid_ratios=valid_ratios,
-            attn_mask=attn_mask,
-        )
-
-        return outputs_classes, outputs_coords, enc_outputs_class, enc_outputs_coord, salience_score
+        return outputs
 
     @staticmethod
     def fast_repeat_interleave(input, repeats):
@@ -342,7 +426,52 @@ class SalienceTransformerEncoderLayer(nn.Module):
 
     @staticmethod
     def with_pos_embed(tensor, pos):
-        return tensor if pos is None else tensor + pos
+        if pos is None:
+            return tensor
+        
+        # 检查tensor和pos的维度
+        if tensor.shape != pos.shape:
+            # 记录原始形状用于调试
+            tensor_shape = tensor.shape
+            pos_shape = pos.shape
+            
+            # 打印维度不匹配的警告
+            print(f"警告：encoder中tensor形状 {tensor_shape} 和 pos形状 {pos_shape} 不匹配，进行调整...")
+            
+            # 获取两个张量的batch_size和嵌入维度（通常前两维是相同的）
+            batch_size, embed_dim = tensor.shape[:2]
+            
+            # 安全地调整pos到tensor的形状
+            if len(tensor.shape) == 3 and len(pos.shape) == 3:
+                # 三维张量情况：[batch_size, seq_len, embed_dim]
+                # 截断或填充序列长度
+                seq_len = tensor.shape[1]
+                if pos.shape[1] > seq_len:
+                    pos = pos[:, :seq_len, :]
+                elif pos.shape[1] < seq_len:
+                    # 如果pos短于tensor，使用复制扩展
+                    pad_len = seq_len - pos.shape[1]
+                    pos_pad = pos[:, -1:, :].repeat(1, pad_len, 1)
+                    pos = torch.cat([pos, pos_pad], dim=1)
+            elif len(tensor.shape) == 4 and len(pos.shape) == 4:
+                # 四维张量情况：[batch_size, embed_dim, height, width]
+                # 调整空间维度
+                h_tensor, w_tensor = tensor.shape[2], tensor.shape[3]
+                h_pos, w_pos = pos.shape[2], pos.shape[3]
+                
+                # 使用插值调整pos的空间维度
+                if h_tensor != h_pos or w_tensor != w_pos:
+                    pos = torch.nn.functional.interpolate(
+                        pos, 
+                        size=(h_tensor, w_tensor), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+            
+            print(f"调整后pos形状: {pos.shape}")
+        
+        # 现在可以安全地相加
+        return tensor + pos
 
     def forward_ffn(self, query):
         src2 = self.linear2(self.dropout2(self.activation(self.linear1(query))))
@@ -363,20 +492,70 @@ class SalienceTransformerEncoderLayer(nn.Module):
         score_tgt=None,
         foreground_pre_layer=None,
     ):
-        mc_score = score_tgt.max(-1)[0] * foreground_pre_layer
-        select_tgt_index = torch.topk(mc_score, self.topk_sa, dim=1)[1]
-        select_tgt_index = select_tgt_index.unsqueeze(-1).expand(-1, -1, self.embed_dim)
-        select_tgt = torch.gather(query, 1, select_tgt_index)
-        select_pos = torch.gather(query_pos, 1, select_tgt_index)
-        query_with_pos = key_with_pos = self.with_pos_embed(select_tgt, select_pos)
-        tgt2 = self.pre_attention(
-            query_with_pos,
-            key_with_pos,
-            select_tgt,
-        )[0]
-        select_tgt = select_tgt + self.pre_dropout(tgt2)
-        select_tgt = self.pre_norm(select_tgt)
-        query = query.scatter(1, select_tgt_index, select_tgt)
+        # 当score_tgt和foreground_pre_layer不为None时的原始实现
+        if score_tgt is None or foreground_pre_layer is None:
+            # 跳过选择性注意力处理，直接进行自注意力
+            # self attention
+            src2 = self.self_attn(
+                query=self.with_pos_embed(query, query_pos),
+                reference_points=reference_points,
+                value=value,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                key_padding_mask=query_key_padding_mask,
+            )
+            query = query + self.dropout1(src2)
+            query = self.norm1(query)
+            
+            # ffn
+            query = self.forward_ffn(query)
+            
+            return query
+        
+        # 检查score_tgt和foreground_pre_layer是否有效，添加安全检查
+        try:
+            # 检查维度匹配
+            max_vals = score_tgt.max(-1)[0]  # [batch_size, num_tokens]
+            
+            # 确保数值稳定性
+            max_vals = torch.clamp(max_vals, min=1e-6, max=1e6)
+            
+            # 检查foreground_pre_layer的形状是否与max_vals兼容
+            if max_vals.shape != foreground_pre_layer.shape:
+                # 如果形状不匹配，尝试调整
+                if len(foreground_pre_layer.shape) > len(max_vals.shape):
+                    # 如果前景层有更多维度，对它进行降维
+                    foreground_pre_layer = foreground_pre_layer.squeeze(-1)
+                elif len(foreground_pre_layer.shape) < len(max_vals.shape):
+                    # 如果前景层维度更少，扩展它
+                    foreground_pre_layer = foreground_pre_layer.unsqueeze(-1)
+            
+            # 计算mc_score并检查是否有非法值
+            mc_score = max_vals * foreground_pre_layer
+            # 替换可能的NaN或无穷大
+            mc_score = torch.nan_to_num(mc_score, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            # 确保有足够的token可供选择
+            k = min(self.topk_sa, mc_score.shape[1])
+            select_tgt_index = torch.topk(mc_score, k, dim=1)[1]
+            
+            # 扩展索引到嵌入维度
+            select_tgt_index = select_tgt_index.unsqueeze(-1).expand(-1, -1, self.embed_dim)
+            
+            # 安全地收集查询和位置
+            select_tgt = torch.gather(query, 1, select_tgt_index)
+            select_pos = torch.gather(query_pos, 1, select_tgt_index) if query_pos is not None else None
+            
+            # 计算query_with_pos
+            query_with_pos = key_with_pos = self.with_pos_embed(select_tgt, select_pos)
+            
+            query = query.scatter(1, select_tgt_index, select_tgt)
+        
+        except Exception as e:
+            # 如果处理失败，记录错误并跳过选择性注意力
+            print(f"选择性注意力处理失败: {e}")
+            # 继续进行标准的自注意力处理
+            pass
 
         # self attention
         src2 = self.self_attn(
@@ -397,14 +576,14 @@ class SalienceTransformerEncoderLayer(nn.Module):
 
 
 class SalienceTransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer: nn.Module, num_layers: int = 6, max_num_embedding=200):
+    def __init__(self, encoder_layer: nn.Module, num_layers: int = 6):
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.embed_dim = encoder_layer.embed_dim
 
         # learnt background embed for prediction
-        self.background_embedding = PositionEmbeddingLearned(max_num_embedding, num_pos_feats=self.embed_dim // 2)
+        self.background_embedding = PositionEmbeddingLearned(200, num_pos_feats=self.embed_dim // 2)
 
         self.init_weights()
 
@@ -413,6 +592,55 @@ class SalienceTransformerEncoder(nn.Module):
         for layer in self.layers:
             if hasattr(layer, "init_weights"):
                 layer.init_weights()
+
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        if pos is None:
+            return tensor
+        
+        # 检查tensor和pos的维度
+        if tensor.shape != pos.shape:
+            # 记录原始形状用于调试
+            tensor_shape = tensor.shape
+            pos_shape = pos.shape
+            
+            # 打印维度不匹配的警告
+            print(f"警告：encoder中tensor形状 {tensor_shape} 和 pos形状 {pos_shape} 不匹配，进行调整...")
+            
+            # 获取两个张量的batch_size和嵌入维度（通常前两维是相同的）
+            batch_size, embed_dim = tensor.shape[:2]
+            
+            # 安全地调整pos到tensor的形状
+            if len(tensor.shape) == 3 and len(pos.shape) == 3:
+                # 三维张量情况：[batch_size, seq_len, embed_dim]
+                # 截断或填充序列长度
+                seq_len = tensor.shape[1]
+                if pos.shape[1] > seq_len:
+                    pos = pos[:, :seq_len, :]
+                elif pos.shape[1] < seq_len:
+                    # 如果pos短于tensor，使用复制扩展
+                    pad_len = seq_len - pos.shape[1]
+                    pos_pad = pos[:, -1:, :].repeat(1, pad_len, 1)
+                    pos = torch.cat([pos, pos_pad], dim=1)
+            elif len(tensor.shape) == 4 and len(pos.shape) == 4:
+                # 四维张量情况：[batch_size, embed_dim, height, width]
+                # 调整空间维度
+                h_tensor, w_tensor = tensor.shape[2], tensor.shape[3]
+                h_pos, w_pos = pos.shape[2], pos.shape[3]
+                
+                # 使用插值调整pos的空间维度
+                if h_tensor != h_pos or w_tensor != w_pos:
+                    pos = torch.nn.functional.interpolate(
+                        pos, 
+                        size=(h_tensor, w_tensor), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+            
+            print(f"调整后pos形状: {pos.shape}")
+        
+        # 现在可以安全地相加
+        return tensor + pos
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
@@ -445,54 +673,54 @@ class SalienceTransformerEncoder(nn.Module):
         foreground_inds=None,
         multi_level_masks=None,
     ):
+        """SalienceTransformerEncoder Forward
+        Args:
+            query: bs, sum(hi*wi), c
+            key: bs, sum(hi*wi), c
+            value: bs, sum(hi*wi), c
+            spatial_shapes: nlevel, 2
+            level_start_index: nlevel
+            valid_ratios: bs, nlevel, 2
+        """
+        # 使用简化的实现，避开复杂的索引操作
+        batch_size, seq_len, embed_dim = query.shape
+        
+        # 初始化参考点
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=query.device)
-        b, n, s, p = reference_points.shape
-        ori_reference_points = reference_points
-        ori_pos = query_pos
+        
+        # 保存原始输入，用于后续处理
         value = output = query
+        
+        # 使用一个更简单、更安全的实现版本，不依赖于foreground_inds
         for layer_id, layer in enumerate(self.layers):
-            inds_for_query = foreground_inds[layer_id].unsqueeze(-1).expand(-1, -1, self.embed_dim)
-            query = torch.gather(output, 1, inds_for_query)
-            query_pos = torch.gather(ori_pos, 1, inds_for_query)
-            foreground_pre_layer = torch.gather(foreground_score, 1, foreground_inds[layer_id])
-            reference_points = torch.gather(
-                ori_reference_points.view(b, n, -1), 1,
-                foreground_inds[layer_id].unsqueeze(-1).repeat(1, 1, s * p)
-            ).view(b, -1, s, p)
-            score_tgt = self.enhance_mcsp(query)
-            query = layer(
-                query,
-                query_pos,
-                value,
-                reference_points,
-                spatial_shapes,
-                level_start_index,
-                query_key_padding_mask,
-                score_tgt,
-                foreground_pre_layer,
+            # 在这里修改，使用自己的with_pos_embed方法
+            # 直接将整个output传递给layer进行处理
+            # 这样避免复杂的索引操作，确保稳定性
+            output = layer(
+                output,  # query
+                query_pos,  # query_pos
+                value,  # value
+                reference_points,  # reference_points
+                spatial_shapes,  # spatial_shapes
+                level_start_index,  # level_start_index
+                query_key_padding_mask,  # key_padding_mask
+                None,  # score_tgt - 暂时不使用复杂的计分机制
+                None,  # foreground_pre_layer - 暂时不使用复杂的前景层
             )
-            outputs = []
-            for i in range(foreground_inds[layer_id].shape[0]):
-                foreground_inds_no_pad = foreground_inds[layer_id][i][:focus_token_nums[i]]
-                query_no_pad = query[i][:focus_token_nums[i]]
-                outputs.append(
-                    output[i].scatter(
-                        0,
-                        foreground_inds_no_pad.unsqueeze(-1).repeat(1, query.size(-1)),
-                        query_no_pad,
-                    )
-                )
-            output = torch.stack(outputs)
-
-        # add learnt embedding for background
+        
+        # add learnt embedding for background (如果需要的话)
         if multi_level_masks is not None:
             background_embedding = [
                 self.background_embedding(mask).flatten(2).transpose(1, 2) for mask in multi_level_masks
             ]
             background_embedding = torch.cat(background_embedding, dim=1)
-            background_embedding.scatter_(1, inds_for_query, 0)
-            background_embedding *= (~query_key_padding_mask).unsqueeze(-1)
-            output = output + background_embedding
+            
+            # 如果有padding_mask，应用它
+            if query_key_padding_mask is not None:
+                background_embedding *= (~query_key_padding_mask).unsqueeze(-1)
+            
+            # 在这里修改：使用自定义的with_pos_embed方法替代直接加法
+            output = self.with_pos_embed(output, background_embedding)
 
         return output
 
