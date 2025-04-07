@@ -467,8 +467,23 @@ class SalienceTransformerEncoderLayer(nn.Module):
                         mode='bilinear', 
                         align_corners=False
                     )
-            
-            print(f"调整后pos形状: {pos.shape}")
+            elif len(tensor.shape) == 3 and len(pos.shape) == 4:
+                atch_size, seq_len, embed_dim = tensor.shape
+                # 将位置编码从 [B, C, H, W] 转换为 [B, H*W, C]
+                pos = pos.flatten(2).permute(0, 2, 1)
+                # 确保序列长度匹配
+                if pos.shape[1] != seq_len:
+                    # 使用插值调整序列维度
+                    pos = pos.permute(0, 2, 1)  # [B, C, L]
+                    pos = torch.nn.functional.interpolate(
+                    pos,
+                    size=seq_len,
+                    mode='linear',
+                    align_corners=False
+                    )
+                pos = pos.permute(0, 2, 1)  # [B, L, C]
+
+        print(f"调整后pos形状: {pos.shape}")
         
         # 现在可以安全地相加
         return tensor + pos

@@ -243,3 +243,12 @@ class RepVGGPluXNetwork(nn.Module):
             output["pool"] = F.max_pool2d(list(output.values())[-1], 1, 2, 0)
         
         return output
+    def forward_single_feature(self, x: Tensor, level_idx: int) -> Tensor:
+        """
+        x: 输入张量 [B, C, H, W]
+        level_idx: 特征层级索引
+        """
+        # 通过指定层处理特征
+        x = self.pan_blocks[level_idx](x)
+        x = self.downsample_blocks[level_idx](x)
+        return x
